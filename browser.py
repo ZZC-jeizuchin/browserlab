@@ -1,13 +1,19 @@
 """
 browser.py
-Browser 抽象层：负责浏览器生命周期、页面导航、JS 执行、标签管理，
-以及通过 CDP 注入网络身份、通用预加载脚本。
+Browser 抽象层：Storage.getCookies 获取全部 Cookie，复用空白页避免标签页弹出。
 """
 
 import subprocess
 import time
-import json
+from urllib.parse import urlparse
 from cdp import CDPManager, CDPClient
+
+
+def _ensure_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        url = "https://" + url
+    return url
 
 
 class Browser:
@@ -17,6 +23,7 @@ class Browser:
         self.cdp_manager = CDPManager(port=debug_port)
         self.cdp_client: CDPClient | None = None
         self.current_tab_id: str | None = None
+        self._domain_visit_callback = None
 
     # ==================== 生命周期 ====================
     def is_running(self) -> bool:
@@ -31,7 +38,7 @@ class Browser:
     def open(self, url: str = "https://example.com") -> None:
         if self.is_running():
             return
-
+        url = _ensure_url(url)
         self.process = subprocess.Popen(
             [
                 "chromium",
@@ -42,18 +49,8 @@ class Browser:
                 url,
             ]
         )
-
         self._wait_for_cdp_ready()
-
-        try:
-            self.cdp_client, self.current_tab_id = self.cdp_manager.connect_to_tab()
-        except Exception:
-            self._terminate_process()
-            raise RuntimeError("无法连接到浏览器页面，请检查 CDP 端口是否可用")
-
-        self.cdp_client.send_command("Page.enable")
-        self.cdp_client.send_command("Runtime.enable")
-        self.cdp_client.send_command("Network.enable")
+        self.sync_active_tab()
 
     def close(self) -> None:
         if not self.is_running():
@@ -61,9 +58,59 @@ class Browser:
         self._cleanup_cdp()
         self._terminate_process()
 
+    def set_domain_visit_callback(self, callback):
+        self._domain_visit_callback = callback
+        if self.cdp_client:
+            self._setup_event_listener()
+
+    # ==================== 标签页同步 ====================
+    def sync_active_tab(self) -> None:
+        try:
+            pages = [t for t in self.cdp_manager.list_tabs() if t.get("type") == "page"]
+            if not pages:
+                self._cleanup_cdp()
+                raise RuntimeError("浏览器没有打开的页面")
+            active_id = pages[0]["id"]
+            if self.current_tab_id != active_id or not self.cdp_client or not self.cdp_client.is_connected:
+                if self.cdp_client:
+                    self.cdp_client.close()
+                ws_url = pages[0]["webSocketDebuggerUrl"]
+                self.cdp_client = CDPClient(ws_url)
+                self.cdp_client.connect()
+                self.current_tab_id = active_id
+                self.cdp_client.send_command("Page.enable")
+                self.cdp_client.send_command("Runtime.enable")
+                self.cdp_client.send_command("Network.enable")
+                self.cdp_client.send_command("DOMStorage.enable")
+                self._setup_event_listener()
+        except Exception:
+            self._cleanup_cdp()
+            raise RuntimeError("无法同步活动标签页")
+
+    def _ensure_connected(self) -> None:
+        if not self.is_running():
+            raise RuntimeError("浏览器未启动")
+        self.sync_active_tab()
+        if not self.cdp_client or not self.cdp_client.is_connected:
+            raise RuntimeError("CDP 连接已断开")
+
+    def _setup_event_listener(self):
+        if not self.cdp_client:
+            return
+        def on_event(method, params):
+            if method == "Page.frameNavigated" and self._domain_visit_callback:
+                url = params.get("frame", {}).get("url", "")
+                if url and not url.startswith("chrome://") and url != "about:blank":
+                    parsed = urlparse(url)
+                    domain = parsed.hostname
+                    if domain:
+                        self._domain_visit_callback(domain)
+        self.cdp_client.set_event_callback(on_event)
+
     # ==================== 页面控制 ====================
     def load_url(self, url: str) -> None:
         self._ensure_connected()
+        url = _ensure_url(url)
         self.cdp_client.send_command("Page.navigate", {"url": url})
 
     def reload(self) -> None:
@@ -97,26 +144,23 @@ class Browser:
 
     def new_tab(self, url: str = "about:blank") -> None:
         self._ensure_connected()
-        new_tab_info = self.cdp_manager.create_new_tab(url)
-        new_id = new_tab_info["id"]
-        self._switch_to_tab(new_id)
+        url = _ensure_url(url) if url != "about:blank" else url
+        try:
+            self.cdp_manager.create_new_tab(url)
+        except Exception as e:
+            raise RuntimeError(f"创建新标签页失败: {e}")
+        self.sync_active_tab()
 
     def close_tab(self) -> None:
         self._ensure_connected()
         if not self.current_tab_id:
             return
+        closing_id = self.current_tab_id
         try:
-            self.cdp_client.send_command("Target.closeTarget", {"targetId": self.current_tab_id})
+            self.cdp_client.send_command("Target.closeTarget", {"targetId": closing_id})
         except RuntimeError:
             pass
-        try:
-            self.cdp_client, self.current_tab_id = self.cdp_manager.connect_to_tab()
-            self.cdp_client.send_command("Page.enable")
-            self.cdp_client.send_command("Runtime.enable")
-            self.cdp_client.send_command("Network.enable")
-        except RuntimeError:
-            self.cdp_client = None
-            self.current_tab_id = None
+        self.sync_active_tab()
 
     # ==================== 网络身份注入 ====================
     def set_user_agent(self, user_agent: str) -> None:
@@ -131,59 +175,179 @@ class Browser:
             "headers": headers
         })
 
-    # ==================== 通用预加载脚本注入 ====================
+    # ==================== LocalStorage 操作 ====================
+    def _storage_id(self, origin: str):
+        return {"securityOrigin": origin, "isLocalStorage": True}
+
+    def get_all_local_storage(self, origin: str) -> dict[str, str]:
+        """直接读取 LocalStorage，失败则通过临时导航空白页读取。"""
+        self._ensure_connected()
+        try:
+            result = self.cdp_client.send_command("DOMStorage.getDOMStorageItems", {
+                "storageId": self._storage_id(origin)
+            })
+            return self._parse_ls_entries(result.get("entries", []))
+        except RuntimeError as e:
+            if "Frame not found" in str(e):
+                return self._read_ls_with_temp_frame(origin)
+            raise
+
+    def _parse_ls_entries(self, entries) -> dict[str, str]:
+        storage = {}
+        for item in entries:
+            if isinstance(item, list) and len(item) == 2:
+                key, value = item[0], item[1]
+            elif isinstance(item, dict):
+                key, value = item["key"], item["value"]
+            else:
+                continue
+            storage[key] = value
+        return storage
+
+    def set_local_storage_item(self, origin: str, key: str, value: str) -> None:
+        self._ensure_connected()
+        try:
+            self.cdp_client.send_command("DOMStorage.setDOMStorageItem", {
+                "storageId": self._storage_id(origin),
+                "key": key,
+                "value": value
+            })
+        except RuntimeError as e:
+            if "Frame not found" in str(e):
+                self._write_ls_with_temp_frame("set", origin, key, value)
+            else:
+                raise
+
+    def remove_local_storage_item(self, origin: str, key: str) -> None:
+        self._ensure_connected()
+        try:
+            self.cdp_client.send_command("DOMStorage.removeDOMStorageItem", {
+                "storageId": self._storage_id(origin),
+                "key": key
+            })
+        except RuntimeError as e:
+            if "Frame not found" in str(e):
+                self._write_ls_with_temp_frame("remove", origin, key)
+            else:
+                raise
+
+    def clear_local_storage(self, origin: str) -> None:
+        self._ensure_connected()
+        try:
+            self.cdp_client.send_command("DOMStorage.clearDOMStorageItems", {
+                "storageId": self._storage_id(origin)
+            })
+        except RuntimeError as e:
+            if "Frame not found" in str(e):
+                self._write_ls_with_temp_frame("clear", origin)
+            else:
+                raise
+
+    # ==================== Cookie 操作 ====================
+    def get_all_cookies(self) -> list[dict]:
+        """
+        使用 Storage.getCookies 获取浏览器全部 Cookie（不依赖当前页面）。
+        """
+        self._ensure_connected()
+        result = self.cdp_client.send_command("Storage.getCookies")
+        cookies = result.get("cookies", [])
+        # 调试输出
+        print("[Browser] 原始 Cookie 数据:")
+        for c in cookies:
+            print(f"  {c.get('domain')}: {c.get('name')} = {c.get('value')}")
+        return cookies
+
+    def set_cookie(self, name: str, value: str, domain: str, path: str = "/") -> None:
+        self._ensure_connected()
+        expires = time.time() + 365 * 24 * 3600
+        self.cdp_client.send_command("Network.setCookie", {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": path,
+            "secure": True,
+            "httpOnly": False,
+            "sameSite": "None",
+            "expires": expires
+        })
+
+    def delete_cookies(self, name: str, domain: str) -> None:
+        self._ensure_connected()
+        self.cdp_client.send_command("Network.deleteCookies", {
+            "name": name,
+            "domain": domain
+        })
+
+    # ==================== 临时导航（复用空白页） ====================
+    def _with_temp_frame(self, origin: str, callback, *args, **kwargs):
+        """
+        在当前标签页（空白页）上临时导航至目标 origin，执行回调后恢复 about:blank。
+        整个过程不创建新标签页，用户无感。
+        """
+        original_url = self.get_url()
+        # 导航到目标域（极轻量资源）
+        self.cdp_client.send_command("Page.navigate", {"url": origin + "/favicon.ico"})
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            try:
+                current = self.get_url()
+                if current.startswith(origin):
+                    break
+            except:
+                pass
+            time.sleep(0.05)
+        # 停止加载并清空文档
+        self.cdp_client.send_command("Page.stopLoading")
+        self.execute_js("document.open();document.write('');document.close();")
+        try:
+            # 执行回调（例如读写 LocalStorage）
+            callback(*args, **kwargs)
+        finally:
+            # 恢复为 about:blank
+            self.cdp_client.send_command("Page.navigate", {"url": "about:blank"})
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                if self.get_url() == "about:blank":
+                    break
+                time.sleep(0.05)
+
+    def _read_ls_with_temp_frame(self, origin: str) -> dict[str, str]:
+        storage = {}
+        def do_read():
+            nonlocal storage
+            result = self.cdp_client.send_command("DOMStorage.getDOMStorageItems", {
+                "storageId": self._storage_id(origin)
+            })
+            storage = self._parse_ls_entries(result.get("entries", []))
+        self._with_temp_frame(origin, do_read)
+        return storage
+
+    def _write_ls_with_temp_frame(self, action: str, origin: str,
+                                    key: str = None, value: str = None):
+        def do_write():
+            sid = self._storage_id(origin)
+            if action == "set":
+                self.cdp_client.send_command("DOMStorage.setDOMStorageItem", {
+                    "storageId": sid, "key": key, "value": value
+                })
+            elif action == "remove":
+                self.cdp_client.send_command("DOMStorage.removeDOMStorageItem", {
+                    "storageId": sid, "key": key
+                })
+            elif action == "clear":
+                self.cdp_client.send_command("DOMStorage.clearDOMStorageItems", {
+                    "storageId": sid
+                })
+        self._with_temp_frame(origin, do_write)
+
+    # ==================== 指纹注入 ====================
     def inject_on_new_document(self, script: str) -> None:
-        """
-        注入一段 JavaScript 脚本，在每次新页面加载前执行。
-        """
         self._ensure_connected()
         self.cdp_client.send_command("Page.addScriptToEvaluateOnNewDocument", {
             "source": script
         })
 
-    # ==================== 读取 Storage 快照 ====================
-    def get_cookies_via_js(self) -> dict[str, str]:
-        """通过 JS 获取当前页面可访问的 Cookie（name: value）"""
-        script = """
-        (function() {
-            const pairs = document.cookie.split('; ');
-            const result = {};
-            for (const p of pairs) {
-                const eq = p.indexOf('=');
-                if (eq > 0) {
-                    const name = decodeURIComponent(p.substring(0, eq));
-                    const value = decodeURIComponent(p.substring(eq + 1));
-                    result[name] = value;
-                }
-            }
-            return result;
-        })()
-        """
-        result = self.execute_js(script)
-        return result if isinstance(result, dict) else {}
-
-    def get_local_storage_via_js(self) -> dict[str, str]:
-        """通过 JS 获取当前页面的所有 LocalStorage 键值对"""
-        script = """
-        (function() {
-            const result = {};
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                result[key] = localStorage.getItem(key);
-            }
-            return result;
-        })()
-        """
-        result = self.execute_js(script)
-        return result if isinstance(result, dict) else {}
-
     # ==================== 内部辅助 ====================
-    def _ensure_connected(self) -> None:
-        if not self.is_running():
-            raise RuntimeError("浏览器未启动")
-        if not self.cdp_client or not self.cdp_client.is_connected:
-            raise RuntimeError("CDP 连接已断开")
-
     def _wait_for_cdp_ready(self, timeout: float = 10) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -214,11 +378,3 @@ class Browser:
             self.cdp_client.close()
             self.cdp_client = None
             self.current_tab_id = None
-
-    def _switch_to_tab(self, tab_id: str) -> None:
-        if self.cdp_client:
-            self.cdp_client.close()
-        self.cdp_client, self.current_tab_id = self.cdp_manager.connect_to_tab(tab_id)
-        self.cdp_client.send_command("Page.enable")
-        self.cdp_client.send_command("Runtime.enable")
-        self.cdp_client.send_command("Network.enable")

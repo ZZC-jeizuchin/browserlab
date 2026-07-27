@@ -1,6 +1,6 @@
 """
 storage_manager.py
-独立的 Storage 管理窗口 - 基于 Text 组件，完全填充、可编辑、带 Reload 按钮。
+独立 Storage 管理窗口 - 所有数据实时从浏览器获取，不缓存。
 """
 
 import tkinter as tk
@@ -22,13 +22,11 @@ class StorageManagerWindow:
         self.refresh_domain_list()
 
     def create_widgets(self):
-        # 顶部
+        # 顶部：Refresh All 按钮 + 写入权限开关
         top_frame = ttk.Frame(self.window)
         top_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=5)
-        self.write_var = tk.BooleanVar(value=self.controller.get_storage_write_permission())
-        ttk.Checkbutton(top_frame, text="允许网站写入 Storage",
-                        variable=self.write_var, command=self.toggle_write_permission).pack(side="left")
-        ttk.Button(top_frame, text="Import from Current Page", command=self.import_current).pack(side="right", padx=5)
+
+        ttk.Button(top_frame, text="Refresh All", command=self.refresh_all).pack(side="left", padx=10)
 
         # 左侧域列表
         left_frame = ttk.Frame(self.window, width=200)
@@ -69,6 +67,7 @@ class StorageManagerWindow:
     def build_text_tab(self, parent, storage_type):
         btn_bar = ttk.Frame(parent)
         btn_bar.pack(fill="x", pady=2)
+
         if storage_type == "cookie":
             ttk.Button(btn_bar, text="Add Cookie", command=self.add_cookie).pack(side="left", padx=2)
             ttk.Button(btn_bar, text="Delete Selected", command=lambda: self.delete_item("cookie")).pack(side="left", padx=2)
@@ -77,7 +76,7 @@ class StorageManagerWindow:
             ttk.Button(btn_bar, text="Add Item", command=self.add_localstorage).pack(side="left", padx=2)
             ttk.Button(btn_bar, text="Delete Selected", command=lambda: self.delete_item("localstorage")).pack(side="left", padx=2)
             ttk.Button(btn_bar, text="Clear All", command=self.clear_localstorage).pack(side="left", padx=2)
-        # 通用 Reload 按钮
+
         ttk.Button(btn_bar, text="Reload Page", command=self.reload_page).pack(side="right", padx=5)
 
         text_frame = ttk.Frame(parent)
@@ -98,7 +97,7 @@ class StorageManagerWindow:
         else:
             self.ls_text = text_widget
 
-    # ---------- 域列表操作 ----------
+    # ================== 域列表操作 ==================
     def refresh_domain_list(self):
         domains = self.controller.get_storage_domains()
         self.domain_listbox.delete(0, tk.END)
@@ -110,7 +109,7 @@ class StorageManagerWindow:
         else:
             self.cookie_text.config(state="normal")
             self.cookie_text.delete("1.0", tk.END)
-            self.cookie_text.insert("1.0", "No domains. Add a domain first.")
+            self.cookie_text.insert("1.0", "No domains.")
             self.cookie_text.config(state="disabled")
             self.ls_text.config(state="normal")
             self.ls_text.delete("1.0", tk.END)
@@ -124,10 +123,11 @@ class StorageManagerWindow:
             self.load_domain_data(domain)
 
     def load_domain_data(self, domain):
-        cookies = self.controller.get_managed_cookies(domain)
-        self._populate_text(self.cookie_text, cookies, title="Cookie (managed)")
-        ls = self.controller.get_managed_local_storage(domain)
-        self._populate_text(self.ls_text, ls, title="LocalStorage (managed)")
+        # 实时从浏览器获取数据
+        cookies = self.controller.get_cookies_for_domain(domain)
+        self._populate_text(self.cookie_text, cookies, title="Cookie (live)")
+        ls = self.controller.get_local_storage_for_domain(domain)
+        self._populate_text(self.ls_text, ls, title="LocalStorage (live)")
 
     def _populate_text(self, text_widget, data_dict, title=""):
         text_widget.config(state="normal")
@@ -144,7 +144,7 @@ class StorageManagerWindow:
         text_widget.config(state="disabled")
         text_widget.tag_config("header", font=("Consolas", 11, "bold"))
 
-    # ---------- 编辑 / 删除 ----------
+    # ================== 编辑 / 删除 ==================
     def edit_item(self, storage_type):
         text_widget = self.cookie_text if storage_type == "cookie" else self.ls_text
         try:
@@ -168,33 +168,39 @@ class StorageManagerWindow:
         if new_val is None:
             return
         if storage_type == "cookie":
-            self.controller.set_managed_cookie(domain, key, new_val)
+            self.controller.set_cookie(domain, key, new_val)
         else:
-            self.controller.set_managed_local_storage_item(domain, key, new_val)
-        self.load_domain_data(domain)
+            self.controller.set_local_storage_item(domain, key, new_val)
+        self.load_domain_data(domain)  # 立即刷新显示
 
     def delete_item(self, storage_type):
         text_widget = self.cookie_text if storage_type == "cookie" else self.ls_text
         try:
-            cursor_index = text_widget.index("insert")
-            line_text = text_widget.get(f"{cursor_index} linestart", f"{cursor_index} lineend").strip()
-            if not line_text or "=" not in line_text:
-                messagebox.showinfo("提示", "请点击要删除的项。")
-                return
-            key = line_text.split("=")[0].strip()
-            domain = self.selected_domain.get()
-            if not domain:
-                return
-            if messagebox.askyesno("确认", f"删除 {key}？"):
-                if storage_type == "cookie":
-                    self.controller.delete_managed_cookie(domain, key)
-                else:
-                    self.controller.delete_managed_local_storage_item(domain, key)
-                self.load_domain_data(domain)
+            sel = text_widget.tag_ranges("sel")
+            if sel:
+                line_text = text_widget.get(sel[0], sel[1]).strip()
+            else:
+                cursor_index = text_widget.index("insert")
+                line_text = text_widget.get(f"{cursor_index} linestart", f"{cursor_index} lineend").strip()
         except Exception:
-            pass
+            return
 
-    # ---------- 添加 / 清空 ----------
+        if not line_text or "=" not in line_text or "(empty)" in line_text:
+            messagebox.showinfo("提示", "请选中要删除的行。")
+            return
+
+        key = line_text.split("=")[0].strip()
+        domain = self.selected_domain.get()
+        if not domain:
+            return
+        if messagebox.askyesno("确认", f"删除 {key}？"):
+            if storage_type == "cookie":
+                self.controller.delete_cookie(domain, key)
+            else:
+                self.controller.delete_local_storage_item(domain, key)
+            self.load_domain_data(domain)
+
+    # ================== 添加 / 清空 ==================
     def add_cookie(self):
         domain = self.selected_domain.get()
         if not domain:
@@ -206,7 +212,7 @@ class StorageManagerWindow:
         value = simpledialog.askstring("添加 Cookie", "值:", parent=self.window)
         if value is None:
             return
-        self.controller.set_managed_cookie(domain, name, value)
+        self.controller.set_cookie(domain, name, value)
         self.load_domain_data(domain)
 
     def add_localstorage(self):
@@ -220,27 +226,26 @@ class StorageManagerWindow:
         value = simpledialog.askstring("添加 LocalStorage", "值:", parent=self.window)
         if value is None:
             return
-        self.controller.set_managed_local_storage_item(domain, key, value)
+        self.controller.set_local_storage_item(domain, key, value)
         self.load_domain_data(domain)
 
     def clear_cookies(self):
         domain = self.selected_domain.get()
-        if domain and messagebox.askyesno("确认", f"清空 {domain} 的所有管理 Cookie？"):
-            self.controller.clear_managed_cookies(domain)
+        if domain and messagebox.askyesno("确认", f"清空 {domain} 的所有 Cookie？"):
+            self.controller.clear_cookies(domain)
             self.load_domain_data(domain)
 
     def clear_localstorage(self):
         domain = self.selected_domain.get()
-        if domain and messagebox.askyesno("确认", f"清空 {domain} 的所有管理 LocalStorage？"):
-            self.controller.clear_managed_local_storage(domain)
+        if domain and messagebox.askyesno("确认", f"清空 {domain} 的所有 LocalStorage？"):
+            self.controller.clear_local_storage(domain)
             self.load_domain_data(domain)
 
-    # ---------- 域管理 ----------
+    # ================== 域管理 ==================
     def add_domain(self):
         domain = simpledialog.askstring("添加域", "输入域名 (例如 example.com):", parent=self.window)
         if domain:
-            self.controller.set_managed_cookie(domain, "_placeholder", "1")
-            self.controller.delete_managed_cookie(domain, "_placeholder")
+            self.controller.storage.add_domain(domain)
             self.refresh_domain_list()
 
     def delete_domain(self):
@@ -248,17 +253,17 @@ class StorageManagerWindow:
         if not sel:
             return
         domain = self.domain_listbox.get(sel[0])
-        if messagebox.askyesno("确认", f"删除域 [{domain}] 及其所有管理数据？"):
-            self.controller.delete_storage_domain(domain)
+        if messagebox.askyesno("确认", f"删除域 [{domain}] 及其所有数据？"):
+            # 从浏览器中清除该域的所有数据
+            self.controller.clear_cookies(domain)
+            self.controller.clear_local_storage(domain)
+            # 从永久域名列表中移除
+            self.controller.storage.remove_domain(domain)
             self.refresh_domain_list()
 
-    # ---------- 权限与导入 ----------
-    def toggle_write_permission(self):
-        allow = self.write_var.get()
-        self.controller.set_storage_write_permission(allow)
-
-    def import_current(self):
-        self.controller.import_current_storage()
+    # ================== 全量刷新 ==================
+    def refresh_all(self):
+        """刷新所有域的显示（重新加载当前选中域）"""
         self.refresh_domain_list()
         sel = self.domain_listbox.curselection()
         if sel:
@@ -267,11 +272,3 @@ class StorageManagerWindow:
 
     def reload_page(self):
         self.controller.reload()
-        # 页面重载后，重新显示当前域数据（延迟等待刷新完成）
-        self.window.after(1000, self._refresh_after_reload)
-
-    def _refresh_after_reload(self):
-        sel = self.domain_listbox.curselection()
-        if sel:
-            domain = self.domain_listbox.get(sel[0])
-            self.load_domain_data(domain)

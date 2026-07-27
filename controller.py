@@ -1,6 +1,6 @@
 """
 controller.py
-Controller 是整个项目的唯一控制中心。
+Controller：增加 Cookie 过滤调试，打印过滤前后的数据。
 """
 
 from browser import Browser
@@ -23,6 +23,9 @@ class Controller:
         self.injector = Injector()
         self.ui = UI(self)
 
+        self.browser.set_domain_visit_callback(self._on_domain_visited)
+        self.open_browser("about:blank")
+
     def run(self):
         self.ui.run()
 
@@ -42,35 +45,15 @@ class Controller:
         return ""
 
     def _apply_injection(self):
-        """生成并注入完整的预加载脚本（Storage 守卫 + Fingerprint 伪装）。"""
         if not self.browser.is_running():
             return
-        domain = self._get_current_domain()
-        if not domain:
-            domain = "unknown"
-
-        # Storage 配置
-        allow_write = self.storage.get_write_permission()
-        cookies = self.storage.get_managed_cookies(domain)
-        local_storage = self.storage.get_managed_local_storage(domain)
-
-        # Fingerprint 配置
         fingerprint_overrides = self.fingerprint.get_injection_overrides()
         special = self.fingerprint.get_special_injection_data()
-
-        # 生成并注入脚本
-        script = self.injector.build_complete_script(
-            allow_write=allow_write,
-            managed_cookies=cookies,
-            managed_local_storage=local_storage,
-            fingerprint_overrides=fingerprint_overrides,
-            special=special
-        )
+        script = self.injector.build_fingerprint_script(fingerprint_overrides, special)
         self._safe_call(self.browser.inject_on_new_document, script)
-        self.ui.log(f"注入脚本已更新，域: {domain}")
 
     # ---------- 浏览器生命周期 ----------
-    def open_browser(self, url="https://example.com"):
+    def open_browser(self, url="about:blank"):
         self._safe_call(self.browser.open, url)
         if self.browser.is_running():
             self._safe_call(self.network.apply_to_browser, self.browser)
@@ -88,7 +71,7 @@ class Controller:
         self._apply_injection()
 
     def reload(self):
-        self._apply_injection()   # 先更新注入脚本，再刷新
+        self._apply_injection()
         self._safe_call(self.browser.reload)
 
     def back(self):
@@ -150,74 +133,63 @@ class Controller:
         self.ui.log("所有自定义请求头已清除。")
 
     # ---------- Storage 管理 ----------
-    def get_storage_write_permission(self) -> bool:
-        return self.storage.get_write_permission()
-
-    def set_storage_write_permission(self, allow: bool):
-        self.storage.set_write_permission(allow)
-        if self.browser.is_running():
-            self._apply_injection()
-        self.ui.log(f"Storage 写入权限已设置为: {'允许' if allow else '禁止'}")
-
     def get_storage_domains(self):
         return self.storage.get_all_domains()
 
-    def get_managed_cookies(self, domain: str):
-        return self.storage.get_managed_cookies(domain)
+    # Cookie（本地过滤）
+    def get_cookies_for_domain(self, domain: str) -> dict:
+        if not self.browser.is_running():
+            return {}
+        all_cookies = self._safe_call(self.browser.get_all_cookies) or []
+        print(f"[Controller] 过滤前 Cookie 总数: {len(all_cookies)}")
+        result = {}
+        for c in all_cookies:
+            cookie_domain = c.get("domain", "").lstrip(".")
+            # 调试打印每个 Cookie 的域匹配情况
+            print(f"  检查 Cookie: domain={cookie_domain}, name={c['name']}, target={domain}")
+            if cookie_domain == domain or cookie_domain.endswith("." + domain) or domain.endswith(cookie_domain):
+                result[c["name"]] = c["value"]
+                print(f"    -> 匹配")
+        print(f"[Controller] 过滤后 Cookie 数量: {len(result)}")
+        return result
 
-    def set_managed_cookie(self, domain: str, name: str, value: str):
-        self.storage.set_cookie(domain, name, value)
-        if self.browser.is_running() and self._get_current_domain() == domain:
-            self._apply_injection()
+    def set_cookie(self, domain: str, name: str, value: str):
+        self._safe_call(self.browser.set_cookie, name, value, domain)
         self.ui.log(f"Cookie [{domain}] {name} = {value}")
 
-    def delete_managed_cookie(self, domain: str, name: str):
-        self.storage.delete_cookie(domain, name)
-        if self.browser.is_running() and self._get_current_domain() == domain:
-            self._apply_injection()
+    def delete_cookie(self, domain: str, name: str):
+        self._safe_call(self.browser.delete_cookies, name, domain)
 
-    def clear_managed_cookies(self, domain: str):
-        self.storage.clear_cookies(domain)
-        if self.browser.is_running() and self._get_current_domain() == domain:
-            self._apply_injection()
+    def clear_cookies(self, domain: str):
+        cookies = self.get_cookies_for_domain(domain)
+        for name in cookies:
+            self._safe_call(self.browser.delete_cookies, name, domain)
 
-    def get_managed_local_storage(self, domain: str):
-        return self.storage.get_managed_local_storage(domain)
-
-    def set_managed_local_storage_item(self, domain: str, key: str, value: str):
-        self.storage.set_local_storage_item(domain, key, value)
-        if self.browser.is_running() and self._get_current_domain() == domain:
-            self._apply_injection()
-
-    def delete_managed_local_storage_item(self, domain: str, key: str):
-        self.storage.delete_local_storage_item(domain, key)
-        if self.browser.is_running() and self._get_current_domain() == domain:
-            self._apply_injection()
-
-    def clear_managed_local_storage(self, domain: str):
-        self.storage.clear_local_storage(domain)
-        if self.browser.is_running() and self._get_current_domain() == domain:
-            self._apply_injection()
-
-    def delete_storage_domain(self, domain: str):
-        self.storage.delete_domain(domain)
-        if self.browser.is_running() and self._get_current_domain() == domain:
-            self._apply_injection()
-        self.ui.log(f"域 [{domain}] 的 Storage 数据已删除。")
-
-    def import_current_storage(self):
-        """从浏览器当前页面导入 Cookie 和 LocalStorage 到管理器中。"""
+    # LocalStorage
+    def get_local_storage_for_domain(self, domain: str) -> dict:
         if not self.browser.is_running():
-            return
-        domain = self._get_current_domain()
-        if not domain:
-            return
-        cookies = self._safe_call(self.browser.get_cookies_via_js) or {}
-        local = self._safe_call(self.browser.get_local_storage_via_js) or {}
-        self.storage.import_from_browser(domain, cookies, local)
-        self.ui.log(f"已从浏览器导入域 [{domain}] 的 Storage 数据")
+            return {}
+        origin = f"https://{domain}"
+        return self._safe_call(self.browser.get_all_local_storage, origin) or {}
 
-    # ---------- Fingerprint 管理 ----------
+    def set_local_storage_item(self, domain: str, key: str, value: str):
+        origin = f"https://{domain}"
+        self._safe_call(self.browser.set_local_storage_item, origin, key, value)
+
+    def delete_local_storage_item(self, domain: str, key: str):
+        origin = f"https://{domain}"
+        self._safe_call(self.browser.remove_local_storage_item, origin, key)
+
+    def clear_local_storage(self, domain: str):
+        origin = f"https://{domain}"
+        self._safe_call(self.browser.clear_local_storage, origin)
+
+    # ---------- 域名自动记录 ----------
+    def _on_domain_visited(self, domain: str):
+        self.storage.add_domain(domain)
+        self.ui.log(f"域名已记录: {domain}")
+
+    # ---------- Fingerprint ----------
     def get_fingerprint_properties(self) -> dict:
         return self.fingerprint.get_all_properties()
 
@@ -234,11 +206,9 @@ class Controller:
         return success
 
     def apply_fingerprint_now(self):
-        """立即将当前指纹配置注入到浏览器（重新注入）"""
         if self.browser.is_running():
             self._apply_injection()
             self.ui.log("指纹配置已重新注入")
 
-    def add_fingerprint_custom_property(self, key: str, default_value=None):
-        self.fingerprint.add_custom_property(key, default_value)
-        self.ui.log(f"已添加自定义指纹属性: {key}")
+    def shutdown(self):
+        pass

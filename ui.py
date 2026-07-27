@@ -1,6 +1,6 @@
 """
 ui.py
-BrowserLab 图形界面：提供浏览器控制、网络身份配置、Storage/Fingerprint 入口和日志输出。
+BrowserLab 图形界面 - 日志区域强制可见。
 """
 
 import tkinter as tk
@@ -13,13 +13,28 @@ class UI:
         self.root = tk.Tk()
         self.root.title("BrowserLab V0.6")
         self.root.geometry("800x650")
-        self.create_widgets()
 
-    def create_widgets(self):
-        # 浏览器控制
-        control_frame = ttk.LabelFrame(self.root, text="浏览器控制", padding=10)
-        control_frame.pack(fill="x", padx=10, pady=5)
+        # 主窗口网格布局，保证日志区域能占满剩余高度
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
 
+        # 最外层用一个主框架
+        main_frame = ttk.Frame(self.root)
+        main_frame.grid(row=0, column=0, sticky="nsew")
+        main_frame.grid_rowconfigure(0, weight=0)  # 控制按钮等
+        main_frame.grid_rowconfigure(1, weight=0)  # 地址栏等
+        main_frame.grid_rowconfigure(2, weight=0)  # JS控制台
+        main_frame.grid_rowconfigure(3, weight=0)  # 网络身份
+        main_frame.grid_rowconfigure(4, weight=0)  # 管理按钮
+        main_frame.grid_rowconfigure(5, weight=1)  # 日志区域（占据剩余空间）
+        main_frame.grid_columnconfigure(0, weight=1)
+
+        self.create_widgets(main_frame)
+
+    def create_widgets(self, parent):
+        # ----- 浏览器控制 -----
+        control_frame = ttk.LabelFrame(parent, text="浏览器控制", padding=10)
+        control_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=5)
         ttk.Button(control_frame, text="Open Browser", command=self.open_browser).pack(side="left", padx=5)
         ttk.Button(control_frame, text="Close Browser", command=self.close_browser).pack(side="left", padx=5)
         ttk.Button(control_frame, text="New Tab", command=self.new_tab).pack(side="left", padx=5)
@@ -27,9 +42,9 @@ class UI:
         self.tab_count_label = ttk.Label(control_frame, text="Tabs: 0")
         self.tab_count_label.pack(side="left", padx=15)
 
-        # 地址栏
-        url_frame = ttk.Frame(self.root)
-        url_frame.pack(fill="x", padx=10, pady=2)
+        # ----- 地址栏 -----
+        url_frame = ttk.Frame(parent)
+        url_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=2)
         ttk.Label(url_frame, text="URL:").pack(side="left")
         self.url_entry = ttk.Entry(url_frame)
         self.url_entry.pack(side="left", fill="x", expand=True, padx=5)
@@ -38,8 +53,8 @@ class UI:
         ttk.Button(url_frame, text="Go", command=self.go).pack(side="left")
 
         # 导航按钮
-        nav_frame = ttk.Frame(self.root)
-        nav_frame.pack(fill="x", padx=10, pady=2)
+        nav_frame = ttk.Frame(parent)
+        nav_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=2)
         ttk.Button(nav_frame, text="← Back", command=self.back).pack(side="left", padx=2)
         ttk.Button(nav_frame, text="→ Forward", command=self.forward).pack(side="left", padx=2)
         ttk.Button(nav_frame, text="Reload", command=self.reload).pack(side="left", padx=2)
@@ -47,8 +62,8 @@ class UI:
         ttk.Button(nav_frame, text="Get Title", command=self.show_title).pack(side="left", padx=2)
 
         # JS 控制台
-        js_frame = ttk.LabelFrame(self.root, text="JavaScript 控制台", padding=10)
-        js_frame.pack(fill="x", padx=10, pady=5)
+        js_frame = ttk.LabelFrame(parent, text="JavaScript 控制台", padding=10)
+        js_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
         self.js_entry = ttk.Entry(js_frame)
         self.js_entry.pack(side="left", fill="x", expand=True, padx=5)
         self.js_entry.insert(0, "document.title")
@@ -56,17 +71,14 @@ class UI:
         ttk.Button(js_frame, text="Execute JS", command=self.execute_js).pack(side="left")
 
         # 网络身份
-        net_frame = ttk.LabelFrame(self.root, text="网络身份 (Network)", padding=10)
-        net_frame.pack(fill="x", padx=10, pady=5)
-
+        net_frame = ttk.LabelFrame(parent, text="网络身份 (Network)", padding=10)
+        net_frame.grid(row=4, column=0, sticky="ew", padx=10, pady=5)
         ua_frame = ttk.Frame(net_frame)
         ua_frame.pack(fill="x", pady=2)
         ttk.Label(ua_frame, text="User-Agent:").pack(side="left")
         self.ua_entry = ttk.Entry(ua_frame)
         self.ua_entry.pack(side="left", fill="x", expand=True, padx=5)
-        self.ua_entry.insert(0, "")
         ttk.Button(ua_frame, text="Set UA", command=self.set_ua).pack(side="left")
-
         hdr_frame = ttk.Frame(net_frame)
         hdr_frame.pack(fill="x", pady=2)
         ttk.Label(hdr_frame, text="Header (key=value):").pack(side="left")
@@ -77,25 +89,36 @@ class UI:
         ttk.Button(hdr_frame, text="Add/Set Header", command=self.set_header).pack(side="left")
         ttk.Button(hdr_frame, text="Clear Headers", command=self.clear_headers).pack(side="left", padx=5)
 
-        # Storage 和 Fingerprint 入口
-        mgmt_frame = ttk.Frame(self.root)
-        mgmt_frame.pack(fill="x", padx=10, pady=5)
+        # 管理按钮
+        mgmt_frame = ttk.Frame(parent)
+        mgmt_frame.grid(row=5, column=0, sticky="ew", padx=10, pady=5)
         ttk.Button(mgmt_frame, text="Manage Storage", command=self.open_storage_manager).pack(side="left")
         ttk.Button(mgmt_frame, text="Manage Fingerprint", command=self.open_fingerprint_manager).pack(side="left", padx=5)
 
-        # 日志
-        log_frame = ttk.LabelFrame(self.root, text="Console Log", padding=10)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        self.console = tk.Text(log_frame, height=15, width=80)
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.console.yview)
-        self.console.configure(yscrollcommand=scrollbar.set)
-        self.console.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        # ----- 日志区域（占据所有剩余垂直空间）-----
+        log_frame = ttk.LabelFrame(parent, text="Console Log", padding=10)
+        log_frame.grid(row=6, column=0, sticky="nsew", padx=10, pady=5)
+        log_frame.grid_propagate(False)   # 防止子组件压缩
+        log_frame.grid_rowconfigure(0, weight=1)
+        log_frame.grid_columnconfigure(0, weight=1)
 
-    # ---------- 辅助 ----------
+        self.console = tk.Text(log_frame, wrap="word", state="normal", height=8)
+        self.console.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.console.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.console.configure(yscrollcommand=scrollbar.set)
+
+        # 强制日志区域在启动时显示一条消息
+        self.log("*** BrowserLab 已启动 ***")
+
+    # ---------- 辅助方法 ----------
     def log(self, message):
+        """插入日志并立即刷新，同时打印到终端"""
+        print(f"[UI] {message}", flush=True)           # 终端同步输出
         self.console.insert(tk.END, message + "\n")
         self.console.see(tk.END)
+        self.console.update_idletasks()                # 强制刷新显示
         self.update_tab_count()
 
     def update_tab_count(self):
@@ -116,11 +139,9 @@ class UI:
         from fingerprint_manager import FingerprintManagerWindow
         FingerprintManagerWindow(self.root, self.controller)
 
-    # ---------- 按钮回调 ----------
+    # 以下回调保持不变（略，与之前相同）
     def open_browser(self):
-        url = self.url_entry.get().strip() or "https://swctools.pages.dev/device"
-        self.controller.open_browser(url)
-        self.log(f"打开浏览器: {url}")
+        self.controller.open_browser("about:blank")
 
     def close_browser(self):
         self.controller.close_browser()
