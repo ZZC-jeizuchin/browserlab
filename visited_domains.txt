@@ -1,3 +1,4 @@
 cn.bing.com
+example.com
 swctools.pages.dev
 www.baidu.com

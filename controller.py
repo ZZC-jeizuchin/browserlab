@@ -1,8 +1,9 @@
 """
 controller.py
-Controller：增加 Cookie 过滤调试，打印过滤前后的数据。
+Controller：集成实时指纹采集功能。
 """
 
+import json
 from browser import Browser
 from ui import UI
 from network import Network
@@ -24,6 +25,8 @@ class Controller:
         self.ui = UI(self)
 
         self.browser.set_domain_visit_callback(self._on_domain_visited)
+
+        # 启动时自动打开浏览器（空白页）
         self.open_browser("about:blank")
 
     def run(self):
@@ -136,21 +139,15 @@ class Controller:
     def get_storage_domains(self):
         return self.storage.get_all_domains()
 
-    # Cookie（本地过滤）
     def get_cookies_for_domain(self, domain: str) -> dict:
         if not self.browser.is_running():
             return {}
         all_cookies = self._safe_call(self.browser.get_all_cookies) or []
-        print(f"[Controller] 过滤前 Cookie 总数: {len(all_cookies)}")
         result = {}
         for c in all_cookies:
             cookie_domain = c.get("domain", "").lstrip(".")
-            # 调试打印每个 Cookie 的域匹配情况
-            print(f"  检查 Cookie: domain={cookie_domain}, name={c['name']}, target={domain}")
             if cookie_domain == domain or cookie_domain.endswith("." + domain) or domain.endswith(cookie_domain):
                 result[c["name"]] = c["value"]
-                print(f"    -> 匹配")
-        print(f"[Controller] 过滤后 Cookie 数量: {len(result)}")
         return result
 
     def set_cookie(self, domain: str, name: str, value: str):
@@ -165,7 +162,6 @@ class Controller:
         for name in cookies:
             self._safe_call(self.browser.delete_cookies, name, domain)
 
-    # LocalStorage
     def get_local_storage_for_domain(self, domain: str) -> dict:
         if not self.browser.is_running():
             return {}
@@ -173,14 +169,20 @@ class Controller:
         return self._safe_call(self.browser.get_all_local_storage, origin) or {}
 
     def set_local_storage_item(self, domain: str, key: str, value: str):
+        if not self.browser.is_running():
+            return
         origin = f"https://{domain}"
         self._safe_call(self.browser.set_local_storage_item, origin, key, value)
 
     def delete_local_storage_item(self, domain: str, key: str):
+        if not self.browser.is_running():
+            return
         origin = f"https://{domain}"
         self._safe_call(self.browser.remove_local_storage_item, origin, key)
 
     def clear_local_storage(self, domain: str):
+        if not self.browser.is_running():
+            return
         origin = f"https://{domain}"
         self._safe_call(self.browser.clear_local_storage, origin)
 
@@ -189,7 +191,7 @@ class Controller:
         self.storage.add_domain(domain)
         self.ui.log(f"域名已记录: {domain}")
 
-    # ---------- Fingerprint ----------
+    # ---------- Fingerprint 管理 ----------
     def get_fingerprint_properties(self) -> dict:
         return self.fingerprint.get_all_properties()
 
@@ -209,6 +211,165 @@ class Controller:
         if self.browser.is_running():
             self._apply_injection()
             self.ui.log("指纹配置已重新注入")
+
+    def refresh_fingerprint_from_browser(self):
+        """通过 CDP 执行 JS 获取浏览器当前真实指纹，并更新 Fingerprint 对象"""
+        if not self.browser.is_running():
+            return
+
+        js_code = """
+        (function() {
+            const result = {};
+            // 1. 用户代理与平台
+            result['navigator.platform'] = navigator.platform;
+            result['navigator.vendor'] = navigator.vendor;
+            result['navigator.vendorSub'] = navigator.vendorSub;
+            result['navigator.productSub'] = navigator.productSub;
+            result['navigator.appName'] = navigator.appName;
+            result['navigator.appCodeName'] = navigator.appCodeName;
+            result['navigator.appVersion'] = navigator.appVersion;
+            result['navigator.oscpu'] = navigator.oscpu || '';
+            result['navigator.buildID'] = navigator.buildID || '';
+            result['navigator.webdriver'] = navigator.webdriver;
+            result['navigator.userAgent'] = navigator.userAgent;
+            // 2. 屏幕与显示
+            result['screen.width'] = screen.width;
+            result['screen.height'] = screen.height;
+            result['screen.availWidth'] = screen.availWidth;
+            result['screen.availHeight'] = screen.availHeight;
+            result['screen.colorDepth'] = screen.colorDepth;
+            result['screen.pixelDepth'] = screen.pixelDepth;
+            result['devicePixelRatio'] = window.devicePixelRatio;
+            result['innerWidth'] = window.innerWidth;
+            result['innerHeight'] = window.innerHeight;
+            try { result['screen.orientation.type'] = screen.orientation.type; } catch(e) { result['screen.orientation.type'] = ''; }
+            try { result['screen.orientation.angle'] = screen.orientation.angle; } catch(e) { result['screen.orientation.angle'] = 0; }
+            // 3. 电池与网络
+            result['battery.charging'] = null;
+            result['battery.level'] = null;
+            result['battery.chargingTime'] = null;
+            result['battery.dischargingTime'] = null;
+            const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+            if (conn) {
+                result['navigator.connection.effectiveType'] = conn.effectiveType;
+                result['navigator.connection.rtt'] = conn.rtt;
+                result['navigator.connection.downlink'] = conn.downlink;
+                result['navigator.connection.saveData'] = conn.saveData;
+            }
+            // 4. 硬件与内存
+            result['navigator.hardwareConcurrency'] = navigator.hardwareConcurrency;
+            result['navigator.deviceMemory'] = navigator.deviceMemory;
+            result['navigator.maxTouchPoints'] = navigator.maxTouchPoints;
+            // 5. 图形与 GPU
+            const canvas = document.createElement('canvas');
+            const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+            if (gl) {
+                const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+                result['webgl.vendor'] = debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : '';
+                result['webgl.renderer'] = debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : '';
+            }
+            result['webgl2.supported'] = !!window.WebGL2RenderingContext;
+            // 6. 音频指纹
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            if (AudioContext) {
+                const ctx = new AudioContext();
+                result['audio.sampleRate'] = ctx.sampleRate;
+                result['audio.state'] = ctx.state;
+            }
+            // 7. 字体检测
+            result['fonts.installed'] = [];
+            // 8. 插件与 MIME
+            result['navigator.plugins'] = Array.from(navigator.plugins).map(p => p.name);
+            result['navigator.mimeTypes'] = Array.from(navigator.mimeTypes).map(m => m.type);
+            // 9. 国际化
+            result['navigator.language'] = navigator.language;
+            result['navigator.languages'] = navigator.languages;
+            result['timezone'] = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            // 10. 传感器与设备
+            result['sensors.accelerometer'] = !!window.Accelerometer;
+            result['sensors.gyroscope'] = !!window.Gyroscope;
+            result['sensors.magnetometer'] = !!window.Magnetometer;
+            result['sensors.ambientLight'] = !!window.AmbientLightSensor;
+            result['sensors.proximity'] = !!window.ProximitySensor;
+            result['mediaDevices'] = [];
+            // 11. 外设与连接
+            result['navigator.bluetooth'] = !!navigator.bluetooth;
+            result['navigator.usb'] = !!navigator.usb;
+            result['navigator.serial'] = !!navigator.serial;
+            result['navigator.hid'] = !!navigator.hid;
+            result['nfc.supported'] = !!window.NDEFReader;
+            result['midi.supported'] = !!navigator.requestMIDIAccess;
+            // 12. 存储与缓存
+            result['storage.localStorage'] = !!window.localStorage;
+            result['storage.sessionStorage'] = !!window.sessionStorage;
+            result['storage.indexedDB'] = !!window.indexedDB;
+            result['storage.cacheStorage'] = !!window.caches;
+            result['storage.opfs'] = !!(navigator.storage && navigator.storage.getDirectory);
+            result['navigator.cookieEnabled'] = navigator.cookieEnabled;
+            // 13. 性能与内存
+            if (performance.memory) {
+                result['performance.memory.jsHeapSizeLimit'] = performance.memory.jsHeapSizeLimit;
+                result['performance.memory.totalJSHeapSize'] = performance.memory.totalJSHeapSize;
+                result['performance.memory.usedJSHeapSize'] = performance.memory.usedJSHeapSize;
+            }
+            // 14. 自动化检测
+            result['navigator.webdriver'] = navigator.webdriver;
+            result['window.chrome'] = !!window.chrome;
+            // 15. 其他 Navigator 属性
+            result['navigator.onLine'] = navigator.onLine;
+            result['navigator.doNotTrack'] = navigator.doNotTrack || '';
+            result['navigator.javaEnabled'] = typeof navigator.javaEnabled === 'function' ? navigator.javaEnabled() : false;
+            result['navigator.pdfViewerEnabled'] = navigator.pdfViewerEnabled;
+            result['navigator.virtualKeyboard'] = !!navigator.virtualKeyboard;
+            // 16. 窗口与文档环境
+            result['outerWidth'] = window.outerWidth;
+            result['outerHeight'] = window.outerHeight;
+            result['screenX'] = window.screenX;
+            result['screenY'] = window.screenY;
+            result['scrollX'] = window.scrollX;
+            result['scrollY'] = window.scrollY;
+            result['visualViewport.width'] = window.visualViewport ? visualViewport.width : 0;
+            result['crossOriginIsolated'] = window.crossOriginIsolated;
+            result['isSecureContext'] = window.isSecureContext;
+            result['document.hidden'] = document.hidden;
+            result['document.visibilityState'] = document.visibilityState;
+            // 17. WebRTC
+            result['webrtc.privateIP'] = '';
+            // 18. Canvas 指纹
+            result['canvas.noise'] = false;
+            // 19. Audio 指纹
+            result['audio.noise'] = false;
+            // 20. WebAssembly
+            result['wasm.supported'] = !!window.WebAssembly;
+            result['wasm.simd'] = false;
+            result['wasm.threads'] = false;
+            // 21. 共享内存
+            result['crossOriginIsolated'] = window.crossOriginIsolated;
+            // 22. 媒体能力
+            result['mediaCapabilities.h264'] = false;
+            result['mediaCapabilities.h265'] = false;
+            result['mediaCapabilities.vp8'] = false;
+            result['mediaCapabilities.vp9'] = false;
+            result['mediaCapabilities.av1'] = false;
+            return JSON.stringify(result);
+        })();
+        """
+
+        raw_result = self._safe_call(self.browser.execute_js, js_code)
+        if not raw_result:
+            self.ui.log("无法获取浏览器指纹")
+            return
+
+        try:
+            data = json.loads(raw_result)
+        except json.JSONDecodeError:
+            self.ui.log("指纹数据解析失败")
+            return
+
+        for key, value in data.items():
+            self.fingerprint.set_property(key, value)
+
+        self.ui.log("已从浏览器读取真实指纹")
 
     def shutdown(self):
         pass

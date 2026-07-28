@@ -1,85 +1,70 @@
-#!/usr/bin/env python3
 """
-最小测试：通过 CDP 获取当前页面的 Cookie 和 LocalStorage。
-已适配 Chromium 返回格式。
+test.py — 验证 Fingerprint 注入脚本是否正确
+用法：先正常启动 BrowserLab 或手动启动 chromium --remote-debugging-port=9222，然后运行本脚本。
 """
 
-import json
-import websocket
-import http.client
+import time
+import sys
+sys.path.insert(0, '.')
+from browser import Browser
+from fingerprint import Fingerprint
+from injector import Injector
 
-def http_get_json(host, port, path):
-    conn = http.client.HTTPConnection(host, port, timeout=3)
-    conn.request("GET", path)
-    resp = conn.getresponse()
-    data = resp.read().decode()
-    conn.close()
-    return json.loads(data)
+def test():
+    # 1. 连接到已运行的 Chromium（假设端口 9222）
+    print("连接浏览器...")
+    b = Browser()
+    # 如果浏览器没启动，启动它
+    if not b.is_running():
+        print("未检测到浏览器，尝试启动...")
+        b.open("about:blank")
+        time.sleep(2)
+    else:
+        print("浏览器已运行")
+        b.sync_active_tab()  # 确保 CDP 连接正常
 
-def get_page_ws_url():
-    tabs = http_get_json("localhost", 9222, "/json")
-    for t in tabs:
-        if t["type"] == "page":
-            return t["webSocketDebuggerUrl"]
-    raise Exception("没有找到打开的页面")
+    # 2. 创建一个 Fingerprint 实例并修改一个简单属性
+    fp = Fingerprint()
+    fp.set_property("navigator.platform", "TestPlatformXYZ")
+    print(f"已设置 navigator.platform = TestPlatformXYZ")
 
-def send_cdp(ws, method, params=None):
-    msg_id = 1
-    payload = {"id": msg_id, "method": method, "params": params or {}}
-    ws.send(json.dumps(payload))
-    while True:
-        raw = ws.recv()
-        resp = json.loads(raw)
-        if resp.get("id") == msg_id:
-            if "error" in resp:
-                print("CDP 错误:", resp["error"])
-                return None
-            return resp.get("result", {})
+    # 3. 生成注入脚本
+    overrides = fp.get_injection_overrides()
+    special = fp.get_special_injection_data()
+    script = Injector.build_fingerprint_script(overrides, special)
 
-def main():
-    ws_url = get_page_ws_url()
-    print("连接到:", ws_url)
-    ws = websocket.create_connection(ws_url, timeout=5)
-    ws.settimeout(1)
+    # 打印生成的脚本（便于检查）
+    print("=" * 60)
+    print("生成的注入脚本：")
+    print(script)
+    print("=" * 60)
 
-    send_cdp(ws, "DOMStorage.enable")
-    send_cdp(ws, "Network.enable")
+    # 4. 通过 CDP 注入
+    try:
+        b.inject_on_new_document(script)
+        print("✅ 注入命令已发送")
+    except Exception as e:
+        print(f"❌ 注入失败: {e}")
+        return
 
-    # 获取当前 origin
-    result = send_cdp(ws, "Runtime.evaluate", {"expression": "window.location.origin", "returnByValue": True})
-    origin = result.get("result", {}).get("value", "")
-    print("当前 origin:", origin)
+    # 5. 打开一个测试页面（about:blank 可以，但我们需要执行 JS，所以用空白页）
+    # 为了简单，直接在当前空白页执行 JS，但注入脚本只对后续页面生效，
+    # 所以这里我们导航到一个新页面（例如 about:blank 再加载一次）。
+    b.execute_js("window.location.href = 'about:blank';")
+    time.sleep(0.5)  # 等待加载
 
-    # 获取 LocalStorage
-    if origin:
-        print("尝试获取 LocalStorage...")
-        result = send_cdp(ws, "DOMStorage.getDOMStorageItems", {
-            "storageId": {"securityOrigin": origin, "isLocalStorage": True}
-        })
-        if result:
-            entries = result.get("entries", [])
-            print(f"LocalStorage 项数: {len(entries)}")
-            for item in entries:
-                # 条目可能是 [key, value] 对
-                if isinstance(item, list) and len(item) == 2:
-                    key, value = item[0], item[1]
-                elif isinstance(item, dict):
-                    key, value = item["key"], item["value"]
-                else:
-                    print("未知格式:", item)
-                    continue
-                print(f"  {key} = {value}")
+    # 6. 读取 navigator.platform
+    result = b.execute_js("navigator.platform")
+    print(f"navigator.platform 实际值: {result}")
 
-    # 获取 Cookie
-    print("尝试获取 Cookie...")
-    result = send_cdp(ws, "Network.getCookies")
-    if result:
-        cookies = result.get("cookies", [])
-        print(f"Cookie 数: {len(cookies)}")
-        for c in cookies:
-            print(f"  {c['name']} = {c['value']} (domain: {c.get('domain', '')})")
+    if result == "TestPlatformXYZ":
+        print("🎉 注入成功！")
+    else:
+        print("💥 注入失败或未覆盖该属性。")
 
-    ws.close()
+    # 7. 检查标志
+    flag = b.execute_js("window.__bl_fingerprint_installed")
+    print(f"__bl_fingerprint_installed: {flag}")
 
 if __name__ == "__main__":
-    main()
+    test()

@@ -1,6 +1,6 @@
 """
 browser.py
-Browser 抽象层：Storage.getCookies 获取全部 Cookie，复用空白页避免标签页弹出。
+Browser 抽象层：LocalStorage 全部删除改为逐项删除。
 """
 
 import subprocess
@@ -180,7 +180,6 @@ class Browser:
         return {"securityOrigin": origin, "isLocalStorage": True}
 
     def get_all_local_storage(self, origin: str) -> dict[str, str]:
-        """直接读取 LocalStorage，失败则通过临时导航空白页读取。"""
         self._ensure_connected()
         try:
             result = self.cdp_client.send_command("DOMStorage.getDOMStorageItems", {
@@ -189,7 +188,7 @@ class Browser:
             return self._parse_ls_entries(result.get("entries", []))
         except RuntimeError as e:
             if "Frame not found" in str(e):
-                return self._read_ls_with_temp_frame(origin)
+                return self._read_ls_with_temp_tab(origin)
             raise
 
     def _parse_ls_entries(self, entries) -> dict[str, str]:
@@ -214,7 +213,7 @@ class Browser:
             })
         except RuntimeError as e:
             if "Frame not found" in str(e):
-                self._write_ls_with_temp_frame("set", origin, key, value)
+                self._write_ls_with_temp_tab("set", origin, key, value)
             else:
                 raise
 
@@ -227,35 +226,30 @@ class Browser:
             })
         except RuntimeError as e:
             if "Frame not found" in str(e):
-                self._write_ls_with_temp_frame("remove", origin, key)
+                self._write_ls_with_temp_tab("remove", origin, key)
             else:
                 raise
 
     def clear_local_storage(self, origin: str) -> None:
+        """清空所有 LocalStorage：先获取所有键，再逐项删除（确保可靠）"""
         self._ensure_connected()
         try:
-            self.cdp_client.send_command("DOMStorage.clearDOMStorageItems", {
-                "storageId": self._storage_id(origin)
-            })
+            # 尝试直接获取所有键并逐项删除
+            ls_data = self.get_all_local_storage(origin)
+            for key in ls_data.keys():
+                self.remove_local_storage_item(origin, key)
         except RuntimeError as e:
             if "Frame not found" in str(e):
-                self._write_ls_with_temp_frame("clear", origin)
+                # 使用临时标签页一次性获取并逐项删除
+                self._clear_ls_with_temp_tab(origin)
             else:
                 raise
 
     # ==================== Cookie 操作 ====================
     def get_all_cookies(self) -> list[dict]:
-        """
-        使用 Storage.getCookies 获取浏览器全部 Cookie（不依赖当前页面）。
-        """
         self._ensure_connected()
         result = self.cdp_client.send_command("Storage.getCookies")
-        cookies = result.get("cookies", [])
-        # 调试输出
-        print("[Browser] 原始 Cookie 数据:")
-        for c in cookies:
-            print(f"  {c.get('domain')}: {c.get('name')} = {c.get('value')}")
-        return cookies
+        return result.get("cookies", [])
 
     def set_cookie(self, name: str, value: str, domain: str, path: str = "/") -> None:
         self._ensure_connected()
@@ -278,67 +272,103 @@ class Browser:
             "domain": domain
         })
 
-    # ==================== 临时导航（复用空白页） ====================
-    def _with_temp_frame(self, origin: str, callback, *args, **kwargs):
-        """
-        在当前标签页（空白页）上临时导航至目标 origin，执行回调后恢复 about:blank。
-        整个过程不创建新标签页，用户无感。
-        """
-        original_url = self.get_url()
-        # 导航到目标域（极轻量资源）
-        self.cdp_client.send_command("Page.navigate", {"url": origin + "/favicon.ico"})
-        deadline = time.time() + 1.0
+    # ==================== 临时标签页 ====================
+    def _create_temp_tab(self, origin: str) -> tuple[CDPClient, str]:
+        original_tab_id = self.current_tab_id
+        new_tab_info = self.cdp_manager.create_new_tab("about:blank")
+        new_tab_id = new_tab_info["id"]
+        if original_tab_id:
+            try:
+                self.cdp_client.send_command("Target.activateTarget", {"targetId": original_tab_id})
+            except:
+                pass
+        ws_url = new_tab_info["webSocketDebuggerUrl"]
+        temp_client = CDPClient(ws_url)
+        temp_client.connect()
+        temp_client.send_command("Page.enable")
+        temp_client.send_command("Runtime.enable")
+        temp_client.send_command("Network.enable")
+        temp_client.send_command("DOMStorage.enable")
+        temp_client.send_command("Page.navigate", {"url": origin + "/favicon.ico"})
+        deadline = time.time() + 1.5
         while time.time() < deadline:
             try:
-                current = self.get_url()
-                if current.startswith(origin):
+                result = temp_client.send_command("Runtime.evaluate", {
+                    "expression": "window.location.href",
+                    "returnByValue": True
+                })
+                url = result.get("result", {}).get("value", "")
+                if url.startswith(origin):
                     break
             except:
                 pass
             time.sleep(0.05)
-        # 停止加载并清空文档
-        self.cdp_client.send_command("Page.stopLoading")
-        self.execute_js("document.open();document.write('');document.close();")
-        try:
-            # 执行回调（例如读写 LocalStorage）
-            callback(*args, **kwargs)
-        finally:
-            # 恢复为 about:blank
-            self.cdp_client.send_command("Page.navigate", {"url": "about:blank"})
-            deadline = time.time() + 0.5
-            while time.time() < deadline:
-                if self.get_url() == "about:blank":
-                    break
-                time.sleep(0.05)
+        temp_client.send_command("Page.stopLoading")
+        temp_client.send_command("Runtime.evaluate", {
+            "expression": "document.open();document.write('');document.close();",
+            "returnByValue": False
+        })
+        return temp_client, new_tab_id
 
-    def _read_ls_with_temp_frame(self, origin: str) -> dict[str, str]:
-        storage = {}
-        def do_read():
-            nonlocal storage
-            result = self.cdp_client.send_command("DOMStorage.getDOMStorageItems", {
+    def _close_temp_tab(self, temp_client: CDPClient, tab_id: str):
+        try:
+            temp_client.send_command("Target.closeTarget", {"targetId": tab_id})
+        except:
+            pass
+        temp_client.close()
+        if self.current_tab_id:
+            try:
+                self.cdp_client.send_command("Target.activateTarget", {"targetId": self.current_tab_id})
+            except:
+                pass
+
+    def _read_ls_with_temp_tab(self, origin: str) -> dict[str, str]:
+        temp_client, tab_id = self._create_temp_tab(origin)
+        try:
+            result = temp_client.send_command("DOMStorage.getDOMStorageItems", {
                 "storageId": self._storage_id(origin)
             })
-            storage = self._parse_ls_entries(result.get("entries", []))
-        self._with_temp_frame(origin, do_read)
-        return storage
+            return self._parse_ls_entries(result.get("entries", []))
+        finally:
+            self._close_temp_tab(temp_client, tab_id)
 
-    def _write_ls_with_temp_frame(self, action: str, origin: str,
-                                    key: str = None, value: str = None):
-        def do_write():
+    def _write_ls_with_temp_tab(self, action: str, origin: str,
+                                key: str = None, value: str = None):
+        temp_client, tab_id = self._create_temp_tab(origin)
+        try:
             sid = self._storage_id(origin)
             if action == "set":
-                self.cdp_client.send_command("DOMStorage.setDOMStorageItem", {
+                temp_client.send_command("DOMStorage.setDOMStorageItem", {
                     "storageId": sid, "key": key, "value": value
                 })
             elif action == "remove":
-                self.cdp_client.send_command("DOMStorage.removeDOMStorageItem", {
+                temp_client.send_command("DOMStorage.removeDOMStorageItem", {
                     "storageId": sid, "key": key
                 })
-            elif action == "clear":
-                self.cdp_client.send_command("DOMStorage.clearDOMStorageItems", {
-                    "storageId": sid
+        finally:
+            self._close_temp_tab(temp_client, tab_id)
+
+    def _clear_ls_with_temp_tab(self, origin: str):
+        """在临时标签页中获取所有键并逐项删除"""
+        temp_client, tab_id = self._create_temp_tab(origin)
+        try:
+            result = temp_client.send_command("DOMStorage.getDOMStorageItems", {
+                "storageId": self._storage_id(origin)
+            })
+            entries = result.get("entries", [])
+            for item in entries:
+                if isinstance(item, list) and len(item) == 2:
+                    key = item[0]
+                elif isinstance(item, dict):
+                    key = item["key"]
+                else:
+                    continue
+                temp_client.send_command("DOMStorage.removeDOMStorageItem", {
+                    "storageId": self._storage_id(origin),
+                    "key": key
                 })
-        self._with_temp_frame(origin, do_write)
+        finally:
+            self._close_temp_tab(temp_client, tab_id)
 
     # ==================== 指纹注入 ====================
     def inject_on_new_document(self, script: str) -> None:
